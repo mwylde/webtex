@@ -5,69 +5,128 @@ var sys = require('sys'),
 	fs = require('fs'),
 	path = require("path"),
 	utils = require('./utils'),
-	uuid = require('./uuid'),
+	Step = require('./step'),
 	redis = kiwi.require('redis-client').createClient(),
 	hashlib = kiwi.require('hashlib');
+	
+exports.USER_DATA_NOT_SENT = "user_data_not_sent";
+exports.NOT_AUTHORIZED = "not_authorized";
+exports.USERNAME_EXISTS = "username_exists";
 
-//All requests should have a field {'auth':12jlk12j4}, where that is the auth-token
-//callback has form function(err, user_hash)
-exports.create_user = function(req, res){
-	utils.getData(req, function(data){
-		/* params should look like this:
-		{
-			username: 'mwylde',
-			password: 'thisismypassword',
-			email: 'mwylde@wesleyan.edu'
+exports.doUser = function(req, res){
+	switch(req.method)
+	{
+		case "PUT":
+			exports.createUser(req,res);
+			break;
+		case "POST":
+			exports.login(req,res);
+			break;
+		default:
+			sys.puts("Method: " + req.method);
+	}
+};
+
+exports.createUser = function(req, res){
+	var params = {};
+	Step(
+		function getJSONData(){
+			sys.puts("Are we running step?");
+			utils.getJSONData(req, this);
+			sys.puts("Are we running step?");
+		},
+		function checkUsernameExists(err, hash){
+			if(err)return utils.sendError(req,res,err);
+			params = hash;
+			sys.puts("Do we have params? " + params);
+			redis.exists('tex:username:' + params.username + ':uid', this);
+		},
+		function getNextUserID(err, exists){
+			if(exists)return utils.sendError(req,res, exports.USERNAME_EXISTS);
+			if(err)return utils.sendError(req,res,err);
+			redis.incr('nextUserID', this);
+		},
+		function createUser(err, userID){
+			if(err)return utils.sendError(req,res,err);
+			setUserField(userID, "username", params.username, this.parallel());
+			setUserField(userID, "password", passHash(params.password), this.parallel());
+			setUserField(userID, "email", params.email, this.parallel());
+			redis.set('tex:username:' + params.username + ':uid', nextUserID, this.parallel());
+		},
+		function sendUserHash(err){
+			if(err)return utils.sendError(req,res,err);
+			return getUserHash(err, req, res, userID, utils.sendJSON);
 		}
-		*/
-		params = JSON.parse(data);
-		redis.incr('nextUserID', function(err, nextUserID){
-			if(err){ utils.sendError(req,res,err); return; }
-			redis.exists('tex:username:' + params.username + ':uid', function(err, exists){
-				if(exists){ utils.sendError(req,res, "username_exists"); return;}
-				if(!err){
-					setUserField(nextUserID, "username", params.username);
-					setUserField(nextUserID, "password", passHash(params.password));
-					setUserField(nextUserID, "email", params.email);
-					redis.set('tex:username:' + params.username + ':uid', nextUserID);
-				}
-				getUserHash(err, req, res, nextUserID, utils.sendJSON);
-			});
-		});
-	});
+	);
 };
 
 exports.login = function(req, res){
-	utils.getData(req, function(data){
-		params = JSON.parse(data);
-		userIDFromUsername(params.username, function(err, userID){
-			if(err){ utils.sendError(req,res,err); return; }
-			checkPassword(userID, params.password, function(err, isValid){
-				if(!isValid){utils.sendError(req,res,"password_incorrect"); return;}
-				getUserHash(err, req, res, nextUserID, utils.sendJSON);
-			});
+	var params = {};
+	Step(
+		function getJSONData(){
+			utils.getJSONData(req, this);
+		},
+		function getUserID(err, hash){
+			if(err)return utils.sendError(req,res,err);
+			params = hash;
+			userIDFromUsername(params.username, this);
+		},
+		function checkPassword(err, userID){
+			if(err)return utils.sendError(req,res,err);
+			checkPassword(userID, params.password, this);
+		},
+		function sendUserHash(err, isValid){
+			getUserHash(err, req, res, userID, utils.sendJSON);
+		}
+	);
+};
+
+exports.logout = function(req, res){
+	exports.processAuth(req,res,function(params){
+		unsetAuth(params.userID);
+		return utils.sendJSON(err, req, res, {'result' : 'user_logged_out'});
+	});
+};
+
+exports.processAuth = function(req, res, callback){
+	utils.getJSONData(req, function(err, hash){
+		if(!hash.user)utils.sendError(req,res,exports.USER_INFO_NOT_SENT, 400);
+		checkAuth(hash.user.userID, hash.user.authtoken, function(err, correct){
+			if(err)return utils.sendError(req,res,err);
+			if(!correct)return utils.sendError(req,res,exports.NOT_AUTHORIZED, 401);
+			callback(hash);
 		});
 	});
 };
 
-exports.logout = function(req, res){
-	utils.getData(req, function(data){
-		params = JSON.parse(data);
-		
+exports.checkAuth = function(userID, auth, callback){
+	getUserField(userID, "authtoken", function(err, result){
+		callback(err, auth == result);
 	});
 };
 
-function setUserField(id, field, value){
-	redis.set('tex:uid:' + id + ':' + field, value);
+exports.stepCheckAuth = function(err, hash){
+	if(!hash.user)this(exports.USER_INFO_NOT_SENT, false);
+	exports.checkAuth(hash.user.userID, hash.user.authtoken, function(err, correct){
+		this(err, hash, correct);
+	});
+};
+
+function unsetAuth(id){
+	redis.del(uidField(id, "authtoken"));
+}
+
+function setUserField(id, field, value, callback){
+	redis.set(uidField(id, field), value, callback);
 }
 
 function getUserField(id, field, callback){
-	redis.get('tex:uid:' + id + ':' + field, callback);
+	redis.get(uidField(id, field), callback);
 }
 
 function getUserFields(id, fields, callback){
 	args = fields.map(function(field){
-		return 'tex:uid' + id + ':' + field;
+		return 'tex:uid:' + id + ':' + field;
 	});
 	args.push(callback);
 	redis.mget.apply(query);
@@ -76,28 +135,33 @@ function getUserFields(id, fields, callback){
 function getUserHash(err, req, res, userID, callback){
 	hash = {};
 	hash.userID = userID;
-	fields = ['username', 'email', 'authtoken', 'authdate', 'permissions'];
-	getUserFields(userID, fields, function(err, results){
-		var iter = 0;
-		fields.forEach(function(field) {
-			hash[field] = results[iter];
-			iter++;
+	fields = ['username', 'email', 'authtoken', 'permissions'];
+	warmAuthCode(userID, function(err, result){
+		getUserFields(userID, fields, function(err, results){
+			var iter = 0;
+			fields.forEach(function(field) {
+				hash[field] = results[iter];
+				iter++;
+			});
+			callback(err, req, res, hash);
 		});
-		if(authDate < Date.now()){
-			newAuth = warmAuthCode();
-			hash.authtoken = newAuth[0];
-			hash.authdate = newAuth[1];
-		}
-		callback(err, req, res, hash);
 	});
 }
 
-function warmAuthCode(err, req, res, userID){
-	var authtoken = hashlib.sha1(Math.random() * 1000 + new Date);
-	var authdate  = Date.now() + 24 * 60 * 60 * 1000;
-	setUserField(userID, 'authtoken', authtoken);
-	setUserFIeld(userID, 'authdate', authdate);
-	return [authtoken, authdate];
+function warmAuthCode(userID, callback){
+	var authField = uidField(userID, 'authtoken');
+	redis.exists(authField, function(err, exists){
+		if(exists)return callback(err, false);
+		var authtoken = hashlib.sha1(Math.random() * 1000 + new Date);
+		redis.set(authField, function(err, result){
+			redis.expire(authField, 24 * 60 * 60);
+			callback(err, true);
+		});
+	});
+}
+
+function uidField(userID, field){
+	return 'tex:uid:' + userID + ':' + field;
 }
 
 function userIDFromUsername(username, callback){
@@ -113,7 +177,3 @@ function checkPassword(userID, putativePassword, callback){
 function passHash(password){
 	return hashlib.sha256("a2961493b7" + password + "b5480dd76df");
 }
-
-exports.login = function(req,res){
-	
-};

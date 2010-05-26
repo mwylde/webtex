@@ -1,8 +1,8 @@
 var sys = require('sys'),
 	http = require('http'),
-	kiwi = require('kiwi'),
 	url = require('url'),
-	doc = require('./document');
+	doc = require('./document'),
+	auth = require('./auth');
 
 http.createServer(function (req, res) {
 	route(req, res);
@@ -11,8 +11,12 @@ http.createServer(function (req, res) {
 function route(req, res) {
 	switch(url.parse(req.url).pathname.split('/')[1])
 	{
+		case "user":
+			sys.puts("Doing user");
+			auth.doUser(req,res);
+			break;
 		case "document":
-			doc.do_document(req, res);
+			doc.doDocument(req, res);
 			break;
 		default:
 			res.writeHeader(404);
